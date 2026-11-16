@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+echo "Running cargo fmt --all -- --check..."
+cargo fmt --all -- --check
+
+echo "Running cargo clippy --all-targets -- -D warnings..."
+cargo clippy --all-targets -- -D warnings
+
+echo "Running cargo test..."
+cargo test
+
+echo "All pre-commit checks passed."
