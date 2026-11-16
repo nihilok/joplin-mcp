@@ -180,6 +180,12 @@ impl JoplinClient {
         self.config.base_url.clone()
     }
 
+    /// Return whether destructive delete tools are enabled.
+    #[must_use]
+    pub fn allow_delete(&self) -> bool {
+        self.config.allow_delete
+    }
+
     fn resolve_endpoint(&self) -> Result<ResolvedEndpoint> {
         if let Some(token) = &self.config.token {
             return Ok(ResolvedEndpoint {

@@ -27,6 +27,14 @@ pub struct Cli {
     #[arg(long, env = "JOPLIN_TOKEN")]
     pub token: Option<String>,
 
+    /// Shell command whose stdout provides the Joplin API token (e.g. Keychain lookup).
+    #[arg(long, env = "JOPLIN_TOKEN_CMD")]
+    pub token_cmd: Option<String>,
+
+    /// Enable destructive delete tools (`delete_note`, `delete_notebook`, `delete_tag`).
+    #[arg(long, env = "JOPLIN_ALLOW_DELETE", default_value_t = false)]
+    pub allow_delete: bool,
+
     /// Request timeout in seconds.
     #[arg(long, env = "JOPLIN_TIMEOUT", default_value_t = 30)]
     pub timeout: u64,
@@ -48,6 +56,7 @@ pub struct Config {
     pub port_override: Option<u16>,
     pub base_url: String,
     pub token: Option<String>,
+    pub allow_delete: bool,
     pub timeout_secs: u64,
 }
 
@@ -79,11 +88,24 @@ impl Config {
             None => format!("http://{}:{}", cli.host, cli.port.unwrap_or(DEFAULT_PORT)),
         };
 
-        let token = cli
+        let explicit_token = cli
             .token
             .clone()
             .or_else(|| std::env::var("JOPLIN_API_TOKEN").ok())
             .filter(|t| !t.trim().is_empty());
+
+        let token = match explicit_token {
+            Some(tok) => Some(tok),
+            None => match cli
+                .token_cmd
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(cmd) => Some(run_token_cmd(cmd)?),
+                None => None,
+            },
+        };
 
         Ok(Self {
             url_override,
@@ -91,6 +113,7 @@ impl Config {
             port_override: cli.port,
             base_url,
             token,
+            allow_delete: cli.allow_delete,
             timeout_secs: cli.timeout,
         })
     }
@@ -179,6 +202,33 @@ fn candidate_settings_paths() -> Vec<(&'static str, PathBuf)> {
     paths
 }
 
+fn run_token_cmd(cmd: &str) -> Result<String> {
+    let output = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/C", cmd]).output()
+    } else {
+        std::process::Command::new("sh").args(["-c", cmd]).output()
+    }
+    .map_err(|e| JoplinError::Config(format!("Failed to execute --token-cmd: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(JoplinError::Config(format!(
+            "--token-cmd exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(JoplinError::Config(
+            "--token-cmd produced empty output".to_string(),
+        ));
+    }
+
+    Ok(token)
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -196,6 +246,8 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: None,
             token: Some("secret".to_string()),
+            token_cmd: None,
+            allow_delete: false,
             timeout: 30,
         };
         let cfg = Config::from_cli(&cli);
@@ -203,6 +255,7 @@ mod tests {
         if let Ok(cfg) = cfg {
             assert_eq!(cfg.base_url, "http://127.0.0.1:41184");
             assert_eq!(cfg.token.as_deref(), Some("secret"));
+            assert!(!cfg.allow_delete);
         }
     }
 
@@ -213,12 +266,15 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: None,
             token: None,
+            token_cmd: None,
+            allow_delete: true,
             timeout: 15,
         };
         let cfg = Config::from_cli(&cli);
         assert!(cfg.is_ok());
         if let Ok(cfg) = cfg {
             assert_eq!(cfg.base_url, "http://localhost:41184");
+            assert!(cfg.allow_delete);
         }
     }
 
@@ -229,9 +285,29 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: None,
             token: None,
+            token_cmd: None,
+            allow_delete: false,
             timeout: 0,
         };
         assert!(Config::from_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn token_cmd_reads_stdout() {
+        let cli = Cli {
+            url: None,
+            host: "127.0.0.1".to_string(),
+            port: None,
+            token: None,
+            token_cmd: Some("echo my-secret-token".to_string()),
+            allow_delete: false,
+            timeout: 30,
+        };
+        let cfg = Config::from_cli(&cli);
+        assert!(cfg.is_ok());
+        if let Ok(cfg) = cfg {
+            assert_eq!(cfg.token.as_deref(), Some("my-secret-token"));
+        }
     }
 
     #[test]

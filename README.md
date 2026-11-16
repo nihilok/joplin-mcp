@@ -60,6 +60,8 @@ Or with an explicit token:
 | Environment Variable | CLI Flag | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `JOPLIN_TOKEN` (or `JOPLIN_API_TOKEN`) | `--token` | — | Joplin Web Clipper API token |
+| `JOPLIN_TOKEN_CMD` | `--token-cmd` | — | Shell command whose stdout provides the token (e.g. Keychain lookup) |
+| `JOPLIN_ALLOW_DELETE` | `--allow-delete` | `false` | Enable `delete_note`, `delete_notebook`, and `delete_tag` |
 | `JOPLIN_URL` | `--url` | — | Full base URL (overrides `--host` and `--port`) |
 | `JOPLIN_HOST` | `--host` | `127.0.0.1` | Joplin Web Clipper host |
 | `JOPLIN_PORT` | `--port` | `41184` | Joplin Web Clipper port |
@@ -68,9 +70,9 @@ Or with an explicit token:
 ## Tools
 
 - **Utility**: `ping`
-- **Notebooks**: `list_notebooks`, `create_notebook`, `update_notebook`, `delete_notebook`
-- **Notes**: `get_note`, `get_note_resources`, `get_links`, `create_note`, `update_note`, `edit_note`, `delete_note`, `find_notes`, `find_in_note`, `find_notes_with_tag`, `find_notes_in_notebook`, `get_all_notes`
-- **Tags**: `list_tags`, `create_tag`, `update_tag`, `delete_tag`, `get_tags_by_note`, `tag_note`, `untag_note`
+- **Notebooks**: `list_notebooks`, `create_notebook`, `update_notebook` (`delete_notebook` with `--allow-delete`)
+- **Notes**: `get_note`, `get_note_resources`, `get_links`, `create_note`, `update_note`, `edit_note`, `find_notes`, `find_in_note`, `find_notes_with_tag`, `find_notes_in_notebook`, `get_all_notes` (`delete_note` with `--allow-delete`)
+- **Tags**: `list_tags`, `create_tag`, `update_tag`, `get_tags_by_note`, `tag_note`, `untag_note` (`delete_tag` with `--allow-delete`)
 - **Trash**: `restore_from_trash`
 
 ## Development

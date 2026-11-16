@@ -7,6 +7,7 @@ use crate::joplin::JoplinClient;
 use crate::tools;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -41,13 +42,16 @@ fn write_message<T: Serialize>(message: &T) {
 }
 
 fn handle_initialize(params: Option<&Value>) -> Value {
-    let client_version = params
+    let requested = params
         .and_then(|p| p.get("protocolVersion"))
-        .and_then(Value::as_str)
+        .and_then(Value::as_str);
+
+    let negotiated = requested
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
         .unwrap_or(PROTOCOL_VERSION);
 
     serde_json::json!({
-        "protocolVersion": client_version,
+        "protocolVersion": negotiated,
         "capabilities": {
             "tools": {}
         },
@@ -58,9 +62,9 @@ fn handle_initialize(params: Option<&Value>) -> Value {
     })
 }
 
-fn handle_tools_list() -> Value {
+fn handle_tools_list(client: &JoplinClient) -> Value {
     serde_json::json!({
-        "tools": tools::all_tools()
+        "tools": tools::all_tools(client.allow_delete())
     })
 }
 
@@ -115,7 +119,7 @@ fn process_request(client: &JoplinClient, request: JsonRpcRequest) -> Option<Jso
     let outcome = match request.method.as_str() {
         "initialize" => Ok(handle_initialize(request.params.as_ref())),
         "ping" => Ok(serde_json::json!({})),
-        "tools/list" => Ok(handle_tools_list()),
+        "tools/list" => Ok(handle_tools_list(client)),
         "tools/call" => handle_tools_call(client, request.params.as_ref()),
         other => Err(JsonRpcError {
             code: -32601,
@@ -184,20 +188,21 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn test_client() -> JoplinClient {
+    fn test_client(allow_delete: bool) -> JoplinClient {
         JoplinClient::new(Config {
             url_override: None,
             host: "127.0.0.1".to_string(),
             port_override: None,
             base_url: "http://127.0.0.1:41184".to_string(),
             token: Some("test-token".to_string()),
+            allow_delete,
             timeout_secs: 5,
         })
     }
 
     #[test]
     fn rejects_invalid_jsonrpc_version() {
-        let client = test_client();
+        let client = test_client(false);
         let req = JsonRpcRequest {
             jsonrpc: "1.0".to_string(),
             id: Some(Value::from(1)),
@@ -213,7 +218,7 @@ mod tests {
 
     #[test]
     fn notifications_return_none() {
-        let client = test_client();
+        let client = test_client(false);
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: None,
@@ -224,38 +229,91 @@ mod tests {
     }
 
     #[test]
-    fn initialize_and_tools_list_succeed() {
-        let client = test_client();
-        let init_req = JsonRpcRequest {
+    fn initialize_negotiates_supported_protocol_version() {
+        let client = test_client(false);
+        let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(Value::from(1)),
             method: "initialize".to_string(),
-            params: Some(serde_json::json!({ "protocolVersion": "2024-11-05" })),
+            params: Some(serde_json::json!({ "protocolVersion": "2099-01-01" })),
         };
-        let init_resp = process_request(&client, init_req);
-        assert!(init_resp.is_some());
-        if let Some(resp) = init_resp {
-            assert!(resp.error.is_none());
-            assert!(resp.result.is_some());
+        let resp = process_request(&client, req);
+        assert!(resp.is_some());
+        if let Some(resp) = resp {
+            let negotiated = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("protocolVersion"))
+                .and_then(Value::as_str);
+            assert_eq!(negotiated, Some(PROTOCOL_VERSION));
         }
+    }
 
+    #[test]
+    fn delete_tools_gated_behind_allow_delete() {
+        let safe_client = test_client(false);
         let list_req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(Value::from(2)),
             method: "tools/list".to_string(),
             params: None,
         };
-        let list_resp = process_request(&client, list_req);
+        let list_resp = process_request(&safe_client, list_req);
         assert!(list_resp.is_some());
         if let Some(resp) = list_resp {
-            assert!(resp.error.is_none());
+            let tools = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("tools"))
+                .and_then(Value::as_array);
+            assert_eq!(tools.map(Vec::len), Some(22));
+            let has_delete = tools.is_some_and(|arr| {
+                arr.iter().any(|t| {
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.starts_with("delete_"))
+                })
+            });
+            assert!(!has_delete);
+        }
+
+        let call_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(3)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "delete_note",
+                "arguments": { "note_id": "abc" }
+            })),
+        };
+        let call_resp = process_request(&safe_client, call_req);
+        assert!(call_resp.is_some());
+        if let Some(resp) = call_resp {
+            let is_err = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("isError"))
+                .and_then(Value::as_bool);
+            assert_eq!(is_err, Some(true));
+        }
+
+        let full_client = test_client(true);
+        let full_list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(4)),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let full_resp = process_request(&full_client, full_list_req);
+        assert!(full_resp.is_some());
+        if let Some(resp) = full_resp {
             let count = resp
                 .result
                 .as_ref()
                 .and_then(|r| r.get("tools"))
                 .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            assert!(count >= 20);
+                .map(Vec::len);
+            assert_eq!(count, Some(25));
         }
     }
 }

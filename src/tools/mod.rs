@@ -18,9 +18,9 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return all MCP tool definitions.
+/// Return all MCP tool definitions, gating destructive delete tools behind `allow_delete`.
 #[must_use]
-pub fn all_tools() -> Vec<ToolDefinition> {
+pub fn all_tools(allow_delete: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![ToolDefinition {
         name: "ping",
         description: "Check connectivity to the local Joplin Web Clipper / Data API.",
@@ -34,6 +34,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     tools.extend(notes::definitions());
     tools.extend(tags::definitions());
     tools.extend(trash::definitions());
+    if !allow_delete {
+        tools.retain(|t| !matches!(t.name, "delete_note" | "delete_notebook" | "delete_tag"));
+    }
     tools
 }
 
@@ -41,9 +44,15 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 ///
 /// # Errors
 ///
-/// Returns [`JoplinError`] if the tool name is unknown, arguments are invalid,
+/// Returns [`JoplinError`] if the tool name is unknown, disabled, arguments are invalid,
 /// or the underlying Joplin API request fails.
 pub fn dispatch(client: &JoplinClient, name: &str, args: &Value) -> Result<String> {
+    if !client.allow_delete() && matches!(name, "delete_note" | "delete_notebook" | "delete_tag") {
+        return Err(JoplinError::InvalidInput(format!(
+            "Tool '{name}' is disabled; start joplin-mcp with --allow-delete to enable delete operations."
+        )));
+    }
+
     match name {
         "ping" => {
             let reply = client.ping()?;
