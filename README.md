@@ -28,10 +28,24 @@ cp target/release/joplin-mcp ~/.local/bin/
 
 ### Antigravity CLI (`agy`) / MCP JSON
 
+When `JOPLIN_TOKEN` is omitted, `joplin-mcp` automatically discovers and probes local Joplin profiles in priority order (**Joplin Desktop** first, then **`joplin-cli`**):
+
 ```json
 {
   "mcpServers": {
-    "joplin": {
+    "joplin-mcp": {
+      "command": "joplin-mcp"
+    }
+  }
+}
+```
+
+Or with an explicit token:
+
+```json
+{
+  "mcpServers": {
+    "joplin-mcp": {
       "command": "joplin-mcp",
       "env": {
         "JOPLIN_TOKEN": "your-joplin-web-clipper-token"

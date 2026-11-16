@@ -186,6 +186,9 @@ mod tests {
 
     fn test_client() -> JoplinClient {
         JoplinClient::new(Config {
+            url_override: None,
+            host: "127.0.0.1".to_string(),
+            port_override: None,
             base_url: "http://127.0.0.1:41184".to_string(),
             token: Some("test-token".to_string()),
             timeout_secs: 5,

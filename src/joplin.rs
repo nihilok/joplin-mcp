@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -114,11 +115,20 @@ pub struct Resource {
     pub updated_time: u64,
 }
 
-/// HTTP client for Joplin's local Web Clipper / Data API.
 #[derive(Debug, Clone)]
+struct ResolvedEndpoint {
+    label: &'static str,
+    base_url: String,
+    token: String,
+}
+
+/// HTTP client for Joplin's local Web Clipper / Data API.
+#[derive(Debug)]
 pub struct JoplinClient {
     config: Config,
     agent: Agent,
+    probe_agent: Agent,
+    resolved: Mutex<Option<ResolvedEndpoint>>,
 }
 
 /// Query parameters for paginated note listing/search endpoints.
@@ -141,13 +151,96 @@ impl JoplinClient {
             .http_status_as_error(false)
             .build();
         let agent = ureq_config.new_agent();
-        Self { config, agent }
+
+        let probe_config = Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(2)))
+            .http_status_as_error(false)
+            .build();
+        let probe_agent = probe_config.new_agent();
+
+        Self {
+            config,
+            agent,
+            probe_agent,
+            resolved: Mutex::new(None),
+        }
     }
 
-    /// Return the configured base URL.
+    /// Return the active or configured base URL.
     #[must_use]
-    pub fn base_url(&self) -> &str {
-        &self.config.base_url
+    pub fn base_url(&self) -> String {
+        if self.config.token.is_some() {
+            return self.config.base_url.clone();
+        }
+        if let Ok(guard) = self.resolved.lock()
+            && let Some(ep) = guard.as_ref()
+        {
+            return ep.base_url.clone();
+        }
+        self.config.base_url.clone()
+    }
+
+    fn resolve_endpoint(&self) -> Result<ResolvedEndpoint> {
+        if let Some(token) = &self.config.token {
+            return Ok(ResolvedEndpoint {
+                label: "configured",
+                base_url: self.config.base_url.clone(),
+                token: token.clone(),
+            });
+        }
+
+        if let Ok(guard) = self.resolved.lock()
+            && let Some(ep) = guard.as_ref()
+        {
+            return Ok(ep.clone());
+        }
+
+        let candidates = self.config.discover_profiles();
+        if candidates.is_empty() {
+            return Err(JoplinError::Config(
+                "No JOPLIN_TOKEN set and no local Joplin settings.json found with api.token."
+                    .to_string(),
+            ));
+        }
+
+        for candidate in &candidates {
+            let probe_url = format_url(
+                &candidate.base_url,
+                "/folders",
+                &[("limit", "1")],
+                Some(&candidate.token),
+            );
+            if let Ok(resp) = self.probe_agent.get(&probe_url).call()
+                && (200..300).contains(&resp.status().as_u16())
+            {
+                let ep = ResolvedEndpoint {
+                    label: candidate.label,
+                    base_url: candidate.base_url.clone(),
+                    token: candidate.token.clone(),
+                };
+                if let Ok(mut guard) = self.resolved.lock() {
+                    *guard = Some(ep.clone());
+                }
+                return Ok(ep);
+            }
+        }
+
+        let checked: Vec<String> = candidates
+            .iter()
+            .map(|c| format!("{} ({})", c.label, c.base_url))
+            .collect();
+        Err(JoplinError::Http(format!(
+            "No running Joplin API found. Checked: {}. Start Joplin Desktop (Web Clipper enabled) or `joplin server start`.",
+            checked.join(", ")
+        )))
+    }
+
+    fn clear_cached_endpoint(&self) {
+        if self.config.token.is_none()
+            && let Ok(mut guard) = self.resolved.lock()
+        {
+            *guard = None;
+        }
     }
 
     fn build_url(
@@ -156,19 +249,12 @@ impl JoplinClient {
         params: &[(&str, &str)],
         require_token: bool,
     ) -> Result<String> {
-        let mut url = format!("{}{}", self.config.base_url, path);
-        let mut has_query = path.contains('?');
-
         if require_token {
-            let token = self.config.require_token()?;
-            push_query_param(&mut url, &mut has_query, "token", token);
+            let ep = self.resolve_endpoint()?;
+            Ok(format_url(&ep.base_url, path, params, Some(&ep.token)))
+        } else {
+            Ok(format_url(&self.base_url(), path, params, None))
         }
-
-        for (k, v) in params {
-            push_query_param(&mut url, &mut has_query, k, v);
-        }
-
-        Ok(url)
     }
 
     fn parse_response<T: DeserializeOwned>(
@@ -207,44 +293,76 @@ impl JoplinClient {
         Ok(())
     }
 
+    fn execute_with_retry<T, F>(&self, op: F) -> Result<T>
+    where
+        F: Fn() -> Result<T>,
+    {
+        match op() {
+            Ok(v) => Ok(v),
+            Err(err)
+                if self.config.token.is_none()
+                    && matches!(
+                        err,
+                        JoplinError::Http(_)
+                            | JoplinError::Api {
+                                status: 401 | 403,
+                                ..
+                            }
+                    ) =>
+            {
+                self.clear_cached_endpoint();
+                op()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn get_json<T: DeserializeOwned>(&self, path: &str, params: &[(&str, &str)]) -> Result<T> {
-        let url = self.build_url(path, params, true)?;
-        let resp = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| JoplinError::Http(format!("GET {path} failed: {e}")))?;
-        Self::parse_response(resp)
+        self.execute_with_retry(|| {
+            let url = self.build_url(path, params, true)?;
+            let resp = self
+                .agent
+                .get(&url)
+                .call()
+                .map_err(|e| JoplinError::Http(format!("GET {path} failed: {e}")))?;
+            Self::parse_response(resp)
+        })
     }
 
     fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let url = self.build_url(path, &[], true)?;
-        let resp = self
-            .agent
-            .post(&url)
-            .send_json(body)
-            .map_err(|e| JoplinError::Http(format!("POST {path} failed: {e}")))?;
-        Self::parse_response(resp)
+        self.execute_with_retry(|| {
+            let url = self.build_url(path, &[], true)?;
+            let resp = self
+                .agent
+                .post(&url)
+                .send_json(body)
+                .map_err(|e| JoplinError::Http(format!("POST {path} failed: {e}")))?;
+            Self::parse_response(resp)
+        })
     }
 
     fn put_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let url = self.build_url(path, &[], true)?;
-        let resp = self
-            .agent
-            .put(&url)
-            .send_json(body)
-            .map_err(|e| JoplinError::Http(format!("PUT {path} failed: {e}")))?;
-        Self::parse_response(resp)
+        self.execute_with_retry(|| {
+            let url = self.build_url(path, &[], true)?;
+            let resp = self
+                .agent
+                .put(&url)
+                .send_json(body)
+                .map_err(|e| JoplinError::Http(format!("PUT {path} failed: {e}")))?;
+            Self::parse_response(resp)
+        })
     }
 
     fn delete(&self, path: &str) -> Result<()> {
-        let url = self.build_url(path, &[], true)?;
-        let resp = self
-            .agent
-            .delete(&url)
-            .call()
-            .map_err(|e| JoplinError::Http(format!("DELETE {path} failed: {e}")))?;
-        Self::parse_empty_response(resp)
+        self.execute_with_retry(|| {
+            let url = self.build_url(path, &[], true)?;
+            let resp = self
+                .agent
+                .delete(&url)
+                .call()
+                .map_err(|e| JoplinError::Http(format!("DELETE {path} failed: {e}")))?;
+            Self::parse_empty_response(resp)
+        })
     }
 
     /// Collect all pages for a paginated endpoint.
@@ -280,21 +398,24 @@ impl JoplinClient {
     ///
     /// Returns [`JoplinError::Http`] or [`JoplinError::Api`] if Joplin is unreachable.
     pub fn ping(&self) -> Result<String> {
-        let url = self.build_url("/ping", &[], false)?;
-        let mut resp = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| JoplinError::Http(format!("GET /ping failed: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| JoplinError::Http(format!("Failed reading /ping response: {e}")))?;
-        if !(200..300).contains(&status) {
-            return Err(JoplinError::Api { status, body: text });
-        }
-        Ok(text)
+        self.execute_with_retry(|| {
+            let ep = self.resolve_endpoint()?;
+            let url = format_url(&ep.base_url, "/ping", &[], None);
+            let mut resp = self
+                .agent
+                .get(&url)
+                .call()
+                .map_err(|e| JoplinError::Http(format!("GET /ping failed: {e}")))?;
+            let status = resp.status().as_u16();
+            let text = resp
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| JoplinError::Http(format!("Failed reading /ping response: {e}")))?;
+            if !(200..300).contains(&status) {
+                return Err(JoplinError::Api { status, body: text });
+            }
+            Ok(format!("{text} (profile: {})", ep.label))
+        })
     }
 
     /// List all notebooks (folders).
@@ -543,6 +664,21 @@ impl JoplinClient {
         let _: Value = self.put_json(&path, &serde_json::json!({ "deleted_time": 0 }))?;
         Ok(())
     }
+}
+
+fn format_url(base_url: &str, path: &str, params: &[(&str, &str)], token: Option<&str>) -> String {
+    let mut url = format!("{base_url}{path}");
+    let mut has_query = path.contains('?');
+
+    if let Some(tok) = token {
+        push_query_param(&mut url, &mut has_query, "token", tok);
+    }
+
+    for (k, v) in params {
+        push_query_param(&mut url, &mut has_query, k, v);
+    }
+
+    url
 }
 
 fn push_query_param(url: &mut String, has_query: &mut bool, key: &str, value: &str) {
