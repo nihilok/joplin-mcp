@@ -7,7 +7,7 @@ license = "MIT"
 description = "Fast, standalone Rust MCP server for Joplin's Data API"
 repository = "https://github.com/nihilok/joplin-mcp"
 readme = "README.md"
-keywords = ["joplin", "mcp", "model-context-protocol", "notes", "ai"]
+keywords = ["joplin", "mcp", "llm", "notes", "ai"]
 categories = ["command-line-utilities"]
 
 [dependencies]
